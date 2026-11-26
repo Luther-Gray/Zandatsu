@@ -14,3 +14,6 @@ Right Click to cancel Zandetsu's Lock.
 ⚠️ Be careful! This tool can affect multiple meshes all at once! Keep your camera (F)ocused using Blockbench's **Center View on Selection** Keybind to make your cuts easier.
 
 🤖 This Project is AI Slop! Use at your own risk!
+
+🖥️🌐 Install
+Installation is the same as every other Blockbench Plugin. Simply Load the Plugin from the Javascript (`zandatsu`) file.
