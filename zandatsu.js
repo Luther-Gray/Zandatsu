@@ -215,6 +215,7 @@
         if (!newVkey) {
           newVkey = mesh.addVertices(localPos)[0];
           edgeCutCache[edgeKey] = newVkey;
+          vertexDistances[newVkey] = 0;
         }
 
         if (keepRing[keepRing.length - 1] !== newVkey) {
@@ -244,6 +245,358 @@
     } else {
       for (let i = 1; i < keepRing.length - 1; i++) {
         addCutFacePolygon(mesh, face, [keepRing[0], keepRing[i], keepRing[i + 1]], uvByVkey);
+      }
+    }
+  }
+
+  function polygonSignedArea2D(points) {
+    let area = 0;
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      area += a.x * b.y - b.x * a.y;
+    }
+    return area * 0.5;
+  }
+
+  function pointInPolygon2D(pt, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x;
+      const yi = poly[i].y;
+      const xj = poly[j].x;
+      const yj = poly[j].y;
+      const intersect =
+        yi > pt.y !== yj > pt.y &&
+        pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi + 1e-12) + xi;
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function isConvexCCW2D(points) {
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      const c = points[(i + 2) % points.length];
+      const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+      if (cross <= 1e-7) return false;
+    }
+    return true;
+  }
+
+  function earClipFallback(contour2D) {
+    const indices = contour2D.map((_, i) => i);
+    const tris = [];
+    let guard = 0;
+    const maxSteps = indices.length * indices.length + 16;
+
+    while (indices.length > 3 && guard++ < maxSteps) {
+      let clipped = false;
+      for (let i = 0; i < indices.length; i++) {
+        const iPrev = indices[(i - 1 + indices.length) % indices.length];
+        const iCurr = indices[i];
+        const iNext = indices[(i + 1) % indices.length];
+        const a = contour2D[iPrev];
+        const b = contour2D[iCurr];
+        const c = contour2D[iNext];
+        const cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if (cross <= 1e-9) continue;
+
+        let containsOther = false;
+        const tri = [a, b, c];
+        for (let j = 0; j < indices.length; j++) {
+          const idx = indices[j];
+          if (idx === iPrev || idx === iCurr || idx === iNext) continue;
+          if (pointInPolygon2D(contour2D[idx], tri)) {
+            containsOther = true;
+            break;
+          }
+        }
+        if (containsOther) continue;
+
+        tris.push([iPrev, iCurr, iNext]);
+        indices.splice(i, 1);
+        clipped = true;
+        break;
+      }
+      if (!clipped) break;
+    }
+    if (indices.length === 3) {
+      tris.push([indices[0], indices[1], indices[2]]);
+    }
+    return tris;
+  }
+
+  /**
+   * Cap any closed boundary loops left lying on the cutting plane.
+   * Ensures cap normals point toward the discarded half (-plane.normal).
+   */
+  function capCutPlane(mesh, plane, vertexDistances, fallbackTexture) {
+    const edgeCounts = {};
+    const edgePairs = {};
+    const edgeTexture = {};
+
+    for (const fkey in mesh.faces) {
+      const face = mesh.faces[fkey];
+      const edges = face.getEdges();
+      for (const [vA, vB] of edges) {
+        const key = vA < vB ? `${vA}:${vB}` : `${vB}:${vA}`;
+        edgeCounts[key] = (edgeCounts[key] || 0) + 1;
+        if (!edgePairs[key]) {
+          edgePairs[key] = [vA, vB];
+          edgeTexture[key] = face.texture;
+        }
+      }
+    }
+
+    const boundaryEdges = [];
+    for (const key in edgeCounts) {
+      if (edgeCounts[key] !== 1) continue;
+      const [vA, vB] = edgePairs[key];
+      const dA = vertexDistances[vA];
+      const dB = vertexDistances[vB];
+      if (
+        dA !== undefined &&
+        dB !== undefined &&
+        Math.abs(dA) <= PLANE_EPSILON &&
+        Math.abs(dB) <= PLANE_EPSILON
+      ) {
+        boundaryEdges.push({ key, vA, vB, texture: edgeTexture[key] });
+      }
+    }
+
+    if (boundaryEdges.length < 3) return;
+
+    const adj = {};
+    for (const edge of boundaryEdges) {
+      if (!adj[edge.vA]) adj[edge.vA] = [];
+      if (!adj[edge.vB]) adj[edge.vB] = [];
+      adj[edge.vA].push({ to: edge.vB, key: edge.key });
+      adj[edge.vB].push({ to: edge.vA, key: edge.key });
+    }
+
+    const usedEdges = new Set();
+    const loops = [];
+
+    for (const edge of boundaryEdges) {
+      if (usedEdges.has(edge.key)) continue;
+      const loop = [edge.vA];
+      usedEdges.add(edge.key);
+      let curr = edge.vB;
+      let closed = false;
+
+      while (true) {
+        if (curr === loop[0]) {
+          closed = true;
+          break;
+        }
+        loop.push(curr);
+        const neighbors = adj[curr] || [];
+        const next = neighbors.find((n) => !usedEdges.has(n.key));
+        if (!next) break;
+        usedEdges.add(next.key);
+        curr = next.to;
+      }
+
+      if (closed && loop.length >= 3) {
+        loops.push({
+          vertices: loop,
+          texture: edge.texture ?? fallbackTexture ?? false,
+        });
+      }
+    }
+
+    if (loops.length === 0) return;
+
+    // Outward normal of the cap faces toward the discarded side (-plane.normal)
+    const nWorld = plane.normal.clone().negate().normalize();
+    const ref =
+      Math.abs(nWorld.x) < 0.9
+        ? new THREE.Vector3(1, 0, 0)
+        : new THREE.Vector3(0, 1, 0);
+    const uWorld = new THREE.Vector3().crossVectors(ref, nWorld).normalize();
+    const vWorld = new THREE.Vector3().crossVectors(nWorld, uWorld).normalize();
+    const normalMatrix = new THREE.Matrix3().getNormalMatrix(mesh.mesh.matrixWorld);
+
+    const worldPos = new THREE.Vector3();
+    const loopInfos = [];
+
+    for (const loop of loops) {
+      const pts2D = loop.vertices.map((vkey) => {
+        worldPos.fromArray(mesh.vertices[vkey]);
+        mesh.mesh.localToWorld(worldPos);
+        return new THREE.Vector2(worldPos.dot(uWorld), worldPos.dot(vWorld));
+      });
+      const area = polygonSignedArea2D(pts2D);
+      if (Math.abs(area) < 1e-8) continue;
+      loopInfos.push({
+        vertices: loop.vertices,
+        pts2D,
+        area,
+        texture: loop.texture,
+      });
+    }
+
+    if (loopInfos.length === 0) return;
+
+    // Determine outer vs hole loops by containment depth
+    for (let i = 0; i < loopInfos.length; i++) {
+      let depth = 0;
+      let parentIdx = -1;
+      const samplePt = loopInfos[i].pts2D[0];
+      for (let j = 0; j < loopInfos.length; j++) {
+        if (i === j) continue;
+        if (
+          Math.abs(loopInfos[j].area) > Math.abs(loopInfos[i].area) &&
+          pointInPolygon2D(samplePt, loopInfos[j].pts2D)
+        ) {
+          depth++;
+          if (
+            parentIdx === -1 ||
+            Math.abs(loopInfos[j].area) < Math.abs(loopInfos[parentIdx].area)
+          ) {
+            parentIdx = j;
+          }
+        }
+      }
+      loopInfos[i].depth = depth;
+      loopInfos[i].parentIdx = parentIdx;
+      loopInfos[i].holes = [];
+    }
+
+    const outers = [];
+    for (let i = 0; i < loopInfos.length; i++) {
+      const info = loopInfos[i];
+      if (info.depth % 2 === 0) {
+        outers.push(info);
+      } else if (info.parentIdx !== -1) {
+        loopInfos[info.parentIdx].holes.push(info);
+      }
+    }
+
+    const emitCapFace = (faceVertices, uvLookup, textureId) => {
+      const unique = [];
+      for (const vkey of faceVertices) {
+        if (!unique.includes(vkey)) unique.push(vkey);
+      }
+      if (unique.length < 3) return;
+
+      const capFace = new MeshFace(mesh, {
+        vertices: unique,
+        texture: textureId,
+      });
+
+      const localNorm = capFace.getNormal(true);
+      const faceNormWorld = new THREE.Vector3(
+        localNorm[0],
+        localNorm[1],
+        localNorm[2]
+      )
+        .applyMatrix3(normalMatrix)
+        .normalize();
+      if (faceNormWorld.dot(nWorld) < 0) {
+        capFace.invert();
+      }
+
+      for (const vkey of capFace.vertices) {
+        const uv = uvLookup[vkey];
+        capFace.uv[vkey] = uv ? [uv[0], uv[1]] : [0, 0];
+      }
+      mesh.addFaces(capFace);
+    };
+
+    for (const outer of outers) {
+      // Ensure outer contour is CCW in (uWorld, vWorld)
+      if (outer.area < 0) {
+        outer.vertices.reverse();
+        outer.pts2D.reverse();
+        outer.area = -outer.area;
+      }
+
+      // Compute planar UV mapping normalized to texture UV bounds
+      let minU = Infinity;
+      let maxU = -Infinity;
+      let minV = Infinity;
+      let maxV = -Infinity;
+      for (const p of outer.pts2D) {
+        if (p.x < minU) minU = p.x;
+        if (p.x > maxU) maxU = p.x;
+        if (p.y < minV) minV = p.y;
+        if (p.y > maxV) maxV = p.y;
+      }
+
+      const texObj = outer.texture
+        ? Texture.all.find((t) => t.uuid === outer.texture)
+        : null;
+      const uvW =
+        (texObj && typeof texObj.getUVWidth === "function"
+          ? texObj.getUVWidth()
+          : Project?.texture_width) || 16;
+      const uvH =
+        (texObj && typeof texObj.getUVHeight === "function"
+          ? texObj.getUVHeight()
+          : Project?.texture_height) || 16;
+
+      const spanU = maxU - minU;
+      const spanV = maxV - minV;
+      const uvScale = Math.min(
+        1,
+        spanU > uvW ? uvW / spanU : 1,
+        spanV > uvH ? uvH / spanV : 1
+      );
+
+      const uvLookup = {};
+      const recordUVs = (verts, pts) => {
+        for (let i = 0; i < verts.length; i++) {
+          uvLookup[verts[i]] = [
+            (pts[i].x - minU) * uvScale,
+            (pts[i].y - minV) * uvScale,
+          ];
+        }
+      };
+      recordUVs(outer.vertices, outer.pts2D);
+
+      if (
+        outer.holes.length === 0 &&
+        (outer.vertices.length === 3 ||
+          (outer.vertices.length === 4 && isConvexCCW2D(outer.pts2D)))
+      ) {
+        emitCapFace(outer.vertices, uvLookup, outer.texture);
+        continue;
+      }
+
+      const combinedVerts = outer.vertices.slice();
+      const holes2D = [];
+      for (const hole of outer.holes) {
+        // Ensure holes are CW
+        if (hole.area > 0) {
+          hole.vertices.reverse();
+          hole.pts2D.reverse();
+          hole.area = -hole.area;
+        }
+        recordUVs(hole.vertices, hole.pts2D);
+        combinedVerts.push(...hole.vertices);
+        holes2D.push(hole.pts2D);
+      }
+
+      let tris = null;
+      if (
+        typeof THREE !== "undefined" &&
+        THREE.ShapeUtils &&
+        typeof THREE.ShapeUtils.triangulateShape === "function"
+      ) {
+        tris = THREE.ShapeUtils.triangulateShape(outer.pts2D, holes2D);
+      } else {
+        tris = earClipFallback(outer.pts2D);
+      }
+
+      for (const [i0, i1, i2] of tris) {
+        emitCapFace(
+          [combinedVerts[i0], combinedVerts[i1], combinedVerts[i2]],
+          uvLookup,
+          outer.texture
+        );
       }
     }
   }
@@ -314,10 +667,23 @@
     for (const { mesh, classification } of worklist) {
       const edgeCutCache = {};
       const deletedFaceSet = new Set();
+      let fallbackTexture = false;
 
       for (const fkey of classification.straddling) {
+        if (!fallbackTexture && mesh.faces[fkey]?.texture) {
+          fallbackTexture = mesh.faces[fkey].texture;
+        }
         cutFace(mesh, fkey, plane, classification.vertexDistances, edgeCutCache);
         deletedFaceSet.add(fkey);
+      }
+
+      if (!fallbackTexture) {
+        for (const fkey of classification.keep) {
+          if (mesh.faces[fkey]?.texture) {
+            fallbackTexture = mesh.faces[fkey].texture;
+            break;
+          }
+        }
       }
 
       for (const fkey of classification.discard) {
@@ -330,6 +696,7 @@
         if (deletedFaceSet.has(selFaces[i])) selFaces.splice(i, 1);
       }
 
+      capCutPlane(mesh, plane, classification.vertexDistances, fallbackTexture);
       deleteOrphanVertices(mesh);
     }
 
@@ -427,8 +794,21 @@
           this.remove();
         }
       };
+      this._pointerDown = null;
+      this._onPointerUp = (event) => {
+        if (!this._pointerDown) return;
+        const down = this._pointerDown;
+        this._pointerDown = null;
+
+        if (event.button !== undefined && event.button !== 0) return;
+        const dist = Math.hypot(event.clientX - down.x, event.clientY - down.y);
+        if (dist > 6) return;
+
+        this.handleStaticClick(event, down.preview);
+      };
       Blockbench.on("update_camera_position", this._onCameraUpdate);
       Blockbench.on("unselect_project", this._onUnselectProject);
+      document.addEventListener("pointerup", this._onPointerUp);
 
       this.updateOverlay();
     }
@@ -461,9 +841,22 @@
     click(data) {
       const preview = this._syncPreview();
       const event = data && data.event ? data.event : null;
+      if (!event) return;
+      if (event.button !== undefined && event.button !== 0) return;
+
+      this._pointerDown = {
+        x: event.clientX,
+        y: event.clientY,
+        preview,
+      };
+    }
+
+    handleStaticClick(event, preview) {
+      if (preview) this.preview = preview;
+      const activePreview = this._syncPreview();
 
       if (!this.pivotLocked) {
-        const cursor = screenCursorNdcFromEvent(event, preview);
+        const cursor = screenCursorNdcFromEvent(event, activePreview);
         if (cursor) {
           this.pivotNdc.set(cursor.x, cursor.y);
         }
@@ -473,9 +866,9 @@
         return;
       }
 
-      const plane = buildCutPlane(this.angle, preview, this.pivotNdc);
+      const plane = buildCutPlane(this.angle, activePreview, this.pivotNdc);
       runCut(plane);
-      this.unlockPivot(data);
+      this.unlockPivot({ event });
     }
 
     unlockPivot(data) {
@@ -564,6 +957,11 @@
         Blockbench.removeListener("unselect_project", this._onUnselectProject);
         this._onUnselectProject = null;
       }
+      if (this._onPointerUp) {
+        document.removeEventListener("pointerup", this._onPointerUp);
+        this._onPointerUp = null;
+      }
+      this._pointerDown = null;
       if (this.group) {
         Canvas.scene.remove(this.group);
         const idx = Canvas.gizmos.indexOf(this.group);
