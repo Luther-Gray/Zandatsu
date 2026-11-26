@@ -123,16 +123,222 @@
       }
     }
 
-    return { keep, discard, straddling };
+    return { keep, discard, straddling, vertexDistances };
   }
 
-  function classifyVisibleMeshes(plane) {
-    const results = {};
-    for (const mesh of Mesh.all) {
-      if (!mesh.visibility || !mesh.mesh || !mesh.mesh.visible) continue;
-      results[mesh.name || mesh.uuid] = classifyMeshFaces(mesh, plane);
+  function interpolateEdgeUV(face, mesh, vA, vB, t, localPos) {
+    const uvA = face.uv && face.uv[vA];
+    const uvB = face.uv && face.uv[vB];
+    if (uvA && uvB) {
+      return [
+        uvA[0] + (uvB[0] - uvA[0]) * t,
+        uvA[1] + (uvB[1] - uvA[1]) * t,
+      ];
     }
-    return results;
+    if (typeof face.localToUV === "function") {
+      return face.localToUV(new THREE.Vector3(localPos[0], localPos[1], localPos[2]));
+    }
+    return [0, 0];
+  }
+
+  function addCutFacePolygon(mesh, origFace, vkeys, uvByVkey) {
+    // Degenerate-face guard: require 3 or 4 unique vertices.
+    const unique = [];
+    for (const vkey of vkeys) {
+      if (!unique.includes(vkey)) unique.push(vkey);
+    }
+    if (unique.length < 3) {
+      console.warn("[Zandatsu] Skipping degenerate cut face with < 3 unique vertices:", vkeys);
+      return null;
+    }
+
+    const newFace = new MeshFace(mesh, {
+      vertices: unique,
+      texture: origFace.texture,
+    });
+    if (typeof origFace.getAngleTo === "function" && origFace.getAngleTo(newFace) > 90) {
+      newFace.invert();
+    }
+    for (const vkey of newFace.vertices) {
+      const uv = uvByVkey[vkey];
+      newFace.uv[vkey] = uv ? [uv[0], uv[1]] : [0, 0];
+    }
+    return mesh.addFaces(newFace)[0];
+  }
+
+  /**
+   * Slice a straddling face along plane, keeping only the positive half.
+   * Reuses edgeCutCache across faces in the same mesh for watertight shared edges.
+   */
+  function cutFace(mesh, fkey, plane, vertexDistances, edgeCutCache) {
+    const face = mesh.faces[fkey];
+    if (!face) return;
+
+    const sorted = face.getSortedVertices();
+    if (!sorted || sorted.length < 3) {
+      delete mesh.faces[fkey];
+      return;
+    }
+
+    const keepRing = [];
+    const uvByVkey = {};
+
+    for (let i = 0; i < sorted.length; i++) {
+      const vA = sorted[i];
+      const vB = sorted[(i + 1) % sorted.length];
+      const dA = vertexDistances[vA];
+      const dB = vertexDistances[vB];
+
+      if (dA >= -PLANE_EPSILON) {
+        if (keepRing[keepRing.length - 1] !== vA) {
+          keepRing.push(vA);
+          uvByVkey[vA] = face.uv && face.uv[vA] ? face.uv[vA].slice() : [0, 0];
+        }
+      }
+
+      const strictlyOpposite =
+        (dA > PLANE_EPSILON && dB < -PLANE_EPSILON) ||
+        (dA < -PLANE_EPSILON && dB > PLANE_EPSILON);
+
+      if (strictlyOpposite) {
+        const t = dA / (dA - dB);
+        const posA = mesh.vertices[vA];
+        const posB = mesh.vertices[vB];
+        const localPos = [
+          posA[0] + (posB[0] - posA[0]) * t,
+          posA[1] + (posB[1] - posA[1]) * t,
+          posA[2] + (posB[2] - posA[2]) * t,
+        ];
+
+        const edgeKey = vA < vB ? `${vA}:${vB}` : `${vB}:${vA}`;
+        let newVkey = edgeCutCache[edgeKey];
+        if (!newVkey) {
+          newVkey = mesh.addVertices(localPos)[0];
+          edgeCutCache[edgeKey] = newVkey;
+        }
+
+        if (keepRing[keepRing.length - 1] !== newVkey) {
+          keepRing.push(newVkey);
+        }
+        uvByVkey[newVkey] = interpolateEdgeUV(face, mesh, vA, vB, t, localPos);
+      }
+    }
+
+    // Deduplicate wrap-around if first and last match
+    if (keepRing.length > 1 && keepRing[0] === keepRing[keepRing.length - 1]) {
+      keepRing.pop();
+    }
+
+    delete mesh.faces[fkey];
+
+    if (keepRing.length < 3) {
+      console.warn("[Zandatsu] Skipping degenerate clipped ring:", keepRing);
+      return;
+    }
+
+    if (keepRing.length === 3 || keepRing.length === 4) {
+      addCutFacePolygon(mesh, face, keepRing, uvByVkey);
+    } else if (keepRing.length === 5) {
+      addCutFacePolygon(mesh, face, [keepRing[0], keepRing[1], keepRing[2], keepRing[3]], uvByVkey);
+      addCutFacePolygon(mesh, face, [keepRing[0], keepRing[3], keepRing[4]], uvByVkey);
+    } else {
+      for (let i = 1; i < keepRing.length - 1; i++) {
+        addCutFacePolygon(mesh, face, [keepRing[0], keepRing[i], keepRing[i + 1]], uvByVkey);
+      }
+    }
+  }
+
+  /**
+   * Remove any vertices in mesh no longer referenced by any face,
+   * and prune deleted vertices from selection buffers.
+   */
+  function deleteOrphanVertices(mesh) {
+    const used = new Set();
+    for (const fkey in mesh.faces) {
+      const face = mesh.faces[fkey];
+      for (const vkey of face.vertices) {
+        used.add(vkey);
+      }
+    }
+
+    const removed = new Set();
+    for (const vkey in mesh.vertices) {
+      if (!used.has(vkey)) {
+        delete mesh.vertices[vkey];
+        removed.add(vkey);
+      }
+    }
+
+    if (removed.size > 0) {
+      const selVerts = mesh.getSelectedVertices(true);
+      for (let i = selVerts.length - 1; i >= 0; i--) {
+        if (removed.has(selVerts[i])) selVerts.splice(i, 1);
+      }
+      const selEdges = mesh.getSelectedEdges(true);
+      for (let i = selEdges.length - 1; i >= 0; i--) {
+        const edge = selEdges[i];
+        if (removed.has(edge[0]) || removed.has(edge[1])) {
+          selEdges.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  function runCut(plane) {
+    if (!plane) return;
+
+    const visibleMeshes = Mesh.all.filter(
+      (m) => m.visibility && m.mesh && m.mesh.visible
+    );
+    if (visibleMeshes.length === 0) {
+      Blockbench.showQuickMessage("No visible meshes to cut", 1500);
+      return;
+    }
+
+    const worklist = [];
+    for (const mesh of visibleMeshes) {
+      const classification = classifyMeshFaces(mesh, plane);
+      if (classification.straddling.length > 0 || classification.discard.length > 0) {
+        worklist.push({ mesh, classification });
+      }
+    }
+
+    if (worklist.length === 0) {
+      Blockbench.showQuickMessage("Cut missed all visible meshes", 1200);
+      return;
+    }
+
+    const affectedMeshes = worklist.map((item) => item.mesh);
+    Undo.initEdit({ elements: affectedMeshes, selection: true });
+
+    for (const { mesh, classification } of worklist) {
+      const edgeCutCache = {};
+      const deletedFaceSet = new Set();
+
+      for (const fkey of classification.straddling) {
+        cutFace(mesh, fkey, plane, classification.vertexDistances, edgeCutCache);
+        deletedFaceSet.add(fkey);
+      }
+
+      for (const fkey of classification.discard) {
+        delete mesh.faces[fkey];
+        deletedFaceSet.add(fkey);
+      }
+
+      const selFaces = mesh.getSelectedFaces(true);
+      for (let i = selFaces.length - 1; i >= 0; i--) {
+        if (deletedFaceSet.has(selFaces[i])) selFaces.splice(i, 1);
+      }
+
+      deleteOrphanVertices(mesh);
+    }
+
+    Canvas.updateView({
+      elements: affectedMeshes,
+      element_aspects: { geometry: true, faces: true, uv: true },
+      selection: true,
+    });
+    Undo.finishEdit("Zandatsu cut");
   }
 
   class ZandatsuContext {
@@ -250,11 +456,6 @@
       }
 
       this.updateOverlay();
-
-      const plane = buildCutPlane(this.angle, preview, this.pivotNdc);
-      if (plane) {
-        console.log("[Zandatsu] Face classification:", classifyVisibleMeshes(plane));
-      }
     }
 
     click(data) {
@@ -272,13 +473,8 @@
         return;
       }
 
-      // Second click confirms the cut (mesh cutting added in Phase 4).
       const plane = buildCutPlane(this.angle, preview, this.pivotNdc);
-      console.log("[Zandatsu] Cut confirmed:", {
-        pivotNdc: { x: this.pivotNdc.x, y: this.pivotNdc.y },
-        angle: this.angle,
-        classification: plane ? classifyVisibleMeshes(plane) : null,
-      });
+      runCut(plane);
       this.unlockPivot(data);
     }
 
