@@ -1,5 +1,11 @@
 (function () {
   let zandatsuTool = null;
+  let discardSideSelect = null;
+  let zandatsuToolbar = null;
+
+  function getDiscardSign() {
+    return discardSideSelect && discardSideSelect.value === "right" ? -1 : 1;
+  }
 
   /**
    * Convert a mouse event (or preview.mouse fallback) to Normalized Device Coordinates.
@@ -56,9 +62,10 @@
     const dx = (cos * step) / halfW;
     const dy = (sin * step) / halfH;
 
-    // Left of the cut line (discard side)
-    const lx = (-sin * step) / halfW;
-    const ly = (cos * step) / halfH;
+    // Discard side: left (-sin, cos) when +1, right (sin, -cos) when -1
+    const sideSign = getDiscardSign();
+    const lx = (-sin * sideSign * step) / halfW;
+    const ly = (cos * sideSign * step) / halfH;
 
     const px = pivotNdc ? pivotNdc.x : 0;
     const py = pivotNdc ? pivotNdc.y : 0;
@@ -66,10 +73,10 @@
     const p0 = new THREE.Vector3(px, py, 0).unproject(preview.camera);
     const p1 = new THREE.Vector3(px + dx, py + dy, 0).unproject(preview.camera);
     const p2 = new THREE.Vector3(px, py, 0.5).unproject(preview.camera);
-    const pLeft = new THREE.Vector3(px + lx, py + ly, 0).unproject(preview.camera);
+    const pDiscard = new THREE.Vector3(px + lx, py + ly, 0).unproject(preview.camera);
 
     const plane = new THREE.Plane().setFromCoplanarPoints(p0, p1, p2);
-    if (plane.distanceToPoint(pLeft) > 0) {
+    if (plane.distanceToPoint(pDiscard) > 0) {
       plane.negate();
     }
     return plane;
@@ -902,9 +909,10 @@
       const dx = (cos * span) / halfW;
       const dy = (sin * span) / halfH;
 
-      // Perpendicular to the left of the cut line (discard side) in NDC
-      const lx = (-sin * span) / halfW;
-      const ly = (cos * span) / halfH;
+      // Perpendicular to the cut line toward the discard side in NDC
+      const sideSign = getDiscardSign();
+      const lx = (-sin * sideSign * span) / halfW;
+      const ly = (cos * sideSign * span) / halfH;
 
       const px = this.pivotNdc.x;
       const py = this.pivotNdc.y;
@@ -986,15 +994,37 @@
     icon: "fa-slash",
     description:
       "Adds a single tool that can cut through a mesh.",
-    version: "0.0.1",
+    version: "1.0.2",
     variant: "both",
 
     onload() {
+      discardSideSelect = new BarSelect("zandatsu_discard_side", {
+        name: "Discard Side",
+        description: "Choose which side of the cut line is removed",
+        category: "tools",
+        condition: () => Modes.edit && Mesh.hasAny(),
+        options: {
+          left: "Discard Left",
+          right: "Discard Right",
+        },
+        value: "left",
+        onChange() {
+          if (ZandatsuContext.current) {
+            ZandatsuContext.current.updateOverlay();
+          }
+        },
+      });
+
+      zandatsuToolbar = new Toolbar("zandatsu", {
+        children: ["zandatsu_discard_side"],
+      });
+
       zandatsuTool = new Tool("zandatsu", {
         name: "Zandatsu",
         description: "Slice through meshes along a screen-space plane",
         icon: "fa-slash",
         transformerMode: "hidden",
+        toolbar: "zandatsu",
         category: "tools",
         selectElements: false,
         cursor: "crosshair",
@@ -1043,6 +1073,19 @@
         }
         zandatsuTool.delete();
         zandatsuTool = null;
+      }
+      if (zandatsuToolbar) {
+        if (zandatsuToolbar.node && zandatsuToolbar.node.parentElement) {
+          zandatsuToolbar.node.remove();
+        }
+        if (typeof Toolbars !== "undefined" && Toolbars.zandatsu === zandatsuToolbar) {
+          delete Toolbars.zandatsu;
+        }
+        zandatsuToolbar = null;
+      }
+      if (discardSideSelect) {
+        discardSideSelect.delete();
+        discardSideSelect = null;
       }
     },
   });
