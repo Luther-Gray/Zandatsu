@@ -2,29 +2,35 @@
   let zandatsuTool = null;
 
   /**
+   * Convert a mouse event (or preview.mouse fallback) to Normalized Device Coordinates.
+   */
+  function screenCursorNdcFromEvent(event, preview) {
+    if (!preview) return null;
+    if (event && typeof event.clientX === "number" && preview.canvas && preview.width && preview.height) {
+      const rect = preview.canvas.getBoundingClientRect();
+      return {
+        x: ((event.clientX - rect.left) / preview.width) * 2 - 1,
+        y: -((event.clientY - rect.top) / preview.height) * 2 + 1,
+      };
+    }
+    if (preview.mouse) {
+      return { x: preview.mouse.x, y: preview.mouse.y };
+    }
+    return null;
+  }
+
+  /**
    * Compute the screen-space angle (in radians) from the pivot to the cursor.
    * Falls back to preview.mouse (NDC) when event is unavailable (e.g. raycast miss).
    */
   function screenAngleFromEvent(event, preview, pivotNdc) {
-    if (!preview) return null;
+    const cursor = screenCursorNdcFromEvent(event, preview);
+    if (!cursor) return null;
+
     const pivotX = pivotNdc ? pivotNdc.x : 0;
     const pivotY = pivotNdc ? pivotNdc.y : 0;
-
-    let mx;
-    let my;
-    if (event && typeof event.clientX === "number" && preview.canvas) {
-      const rect = preview.canvas.getBoundingClientRect();
-      mx = ((event.clientX - rect.left) / preview.width) * 2 - 1;
-      my = -((event.clientY - rect.top) / preview.height) * 2 + 1;
-    } else if (preview.mouse) {
-      mx = preview.mouse.x;
-      my = preview.mouse.y;
-    } else {
-      return null;
-    }
-
-    const dx = (mx - pivotX) * (preview.width / 2);
-    const dy = (my - pivotY) * (preview.height / 2);
+    const dx = (cursor.x - pivotX) * (preview.width / 2);
+    const dy = (cursor.y - pivotY) * (preview.height / 2);
     if (dx === 0 && dy === 0) return null;
     return Math.atan2(dy, dx);
   }
@@ -33,6 +39,7 @@
     constructor() {
       this.angle = Math.PI / 2;
       this.pivotNdc = new THREE.Vector2(0, 0);
+      this.pivotLocked = false;
       this.preview = Canvas.getHoveredPreview() || Preview.selected;
 
       this.group = new THREE.Group();
@@ -78,8 +85,28 @@
       this.quad.frustumCulled = false;
       this.quad.renderOrder = 999;
 
+      // Pivot marker (1 vertex, visible when pivot is locked)
+      this.pivotGeo = new THREE.BufferGeometry();
+      this.pivotPositions = new Float32Array(3);
+      this.pivotGeo.setAttribute(
+        "position",
+        new THREE.BufferAttribute(this.pivotPositions, 3)
+      );
+      this.pivotMat = new THREE.PointsMaterial({
+        size: 9,
+        sizeAttenuation: false,
+        color: 0xffffff,
+        depthTest: false,
+        depthWrite: false,
+      });
+      this.pivotPoint = new THREE.Points(this.pivotGeo, this.pivotMat);
+      this.pivotPoint.frustumCulled = false;
+      this.pivotPoint.renderOrder = 1001;
+      this.pivotPoint.visible = false;
+
       this.group.add(this.quad);
       this.group.add(this.line);
+      this.group.add(this.pivotPoint);
 
       Canvas.scene.add(this.group);
       Canvas.gizmos.push(this.group);
@@ -89,19 +116,73 @@
           this.updateOverlay();
         }
       };
+      this._onUnselectProject = () => {
+        if (ZandatsuContext.current === this) {
+          this.remove();
+        }
+      };
       Blockbench.on("update_camera_position", this._onCameraUpdate);
+      Blockbench.on("unselect_project", this._onUnselectProject);
 
       this.updateOverlay();
     }
 
-    hover(data) {
+    _syncPreview() {
       const preview = Canvas.getHoveredPreview() || Preview.selected;
       if (preview) this.preview = preview;
+      return this.preview;
+    }
 
+    hover(data) {
+      const preview = this._syncPreview();
       const event = data && data.event ? data.event : null;
-      const nextAngle = screenAngleFromEvent(event, this.preview, this.pivotNdc);
-      if (nextAngle !== null) {
-        this.angle = nextAngle;
+
+      if (!this.pivotLocked) {
+        const cursor = screenCursorNdcFromEvent(event, preview);
+        if (cursor) {
+          this.pivotNdc.set(cursor.x, cursor.y);
+        }
+      } else {
+        const nextAngle = screenAngleFromEvent(event, preview, this.pivotNdc);
+        if (nextAngle !== null) {
+          this.angle = nextAngle;
+        }
+      }
+
+      this.updateOverlay();
+    }
+
+    click(data) {
+      const preview = this._syncPreview();
+      const event = data && data.event ? data.event : null;
+
+      if (!this.pivotLocked) {
+        const cursor = screenCursorNdcFromEvent(event, preview);
+        if (cursor) {
+          this.pivotNdc.set(cursor.x, cursor.y);
+        }
+        this.pivotLocked = true;
+        this.pivotPoint.visible = true;
+        this.updateOverlay();
+        return;
+      }
+
+      // Second click confirms the cut (mesh cutting added in Phase 4).
+      console.log("[Zandatsu] Cut confirmed:", {
+        pivotNdc: { x: this.pivotNdc.x, y: this.pivotNdc.y },
+        angle: this.angle,
+      });
+      this.unlockPivot(data);
+    }
+
+    unlockPivot(data) {
+      this.pivotLocked = false;
+      this.pivotPoint.visible = false;
+      const preview = this._syncPreview();
+      const event = data && data.event ? data.event : null;
+      const cursor = screenCursorNdcFromEvent(event, preview);
+      if (cursor) {
+        this.pivotNdc.set(cursor.x, cursor.y);
       }
       this.updateOverlay();
     }
@@ -133,10 +214,16 @@
       const py = this.pivotNdc.y;
       const ndcZ = 0;
 
+      const pPivot = new THREE.Vector3(px, py, ndcZ).unproject(preview.camera);
       const pA = new THREE.Vector3(px - dx, py - dy, ndcZ).unproject(preview.camera);
       const pB = new THREE.Vector3(px + dx, py + dy, ndcZ).unproject(preview.camera);
       const pBL = new THREE.Vector3(px + dx + lx, py + dy + ly, ndcZ).unproject(preview.camera);
       const pAL = new THREE.Vector3(px - dx + lx, py - dy + ly, ndcZ).unproject(preview.camera);
+
+      this.pivotPositions[0] = pPivot.x;
+      this.pivotPositions[1] = pPivot.y;
+      this.pivotPositions[2] = pPivot.z;
+      this.pivotGeo.attributes.position.needsUpdate = true;
 
       this.linePositions[0] = pA.x;
       this.linePositions[1] = pA.y;
@@ -170,6 +257,10 @@
         Blockbench.removeListener("update_camera_position", this._onCameraUpdate);
         this._onCameraUpdate = null;
       }
+      if (this._onUnselectProject) {
+        Blockbench.removeListener("unselect_project", this._onUnselectProject);
+        this._onUnselectProject = null;
+      }
       if (this.group) {
         Canvas.scene.remove(this.group);
         const idx = Canvas.gizmos.indexOf(this.group);
@@ -179,6 +270,8 @@
       this.lineMat?.dispose();
       this.quadGeo?.dispose();
       this.quadMat?.dispose();
+      this.pivotGeo?.dispose();
+      this.pivotMat?.dispose();
       if (ZandatsuContext.current === this) {
         ZandatsuContext.current = null;
       }
@@ -213,7 +306,16 @@
           ZandatsuContext.current.hover(data);
         },
         onCanvasClick(data) {
-          console.log("[Zandatsu] onCanvasClick:", data);
+          if (!ZandatsuContext.current) {
+            ZandatsuContext.current = new ZandatsuContext();
+          }
+          ZandatsuContext.current.click(data);
+        },
+        onCanvasRightClick(data) {
+          if (ZandatsuContext.current && ZandatsuContext.current.pivotLocked) {
+            ZandatsuContext.current.unlockPivot(data);
+            return false;
+          }
         },
         onSelect() {
           if (!ZandatsuContext.current) {
