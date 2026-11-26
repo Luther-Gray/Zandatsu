@@ -35,6 +35,106 @@
     return Math.atan2(dy, dx);
   }
 
+  /**
+   * Build a world-space THREE.Plane from the screen-space cut line.
+   * Positive distance = keep side; negative distance = discard (red) side.
+   */
+  function buildCutPlane(angle, preview, pivotNdc) {
+    if (!preview || !preview.camera || !preview.width || !preview.height) {
+      return null;
+    }
+
+    preview.camera.updateMatrixWorld();
+
+    const halfW = preview.width / 2;
+    const halfH = preview.height / 2;
+    const step = Math.min(halfW, halfH) * 0.5;
+
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+
+    const dx = (cos * step) / halfW;
+    const dy = (sin * step) / halfH;
+
+    // Left of the cut line (discard side)
+    const lx = (-sin * step) / halfW;
+    const ly = (cos * step) / halfH;
+
+    const px = pivotNdc ? pivotNdc.x : 0;
+    const py = pivotNdc ? pivotNdc.y : 0;
+
+    const p0 = new THREE.Vector3(px, py, 0).unproject(preview.camera);
+    const p1 = new THREE.Vector3(px + dx, py + dy, 0).unproject(preview.camera);
+    const p2 = new THREE.Vector3(px, py, 0.5).unproject(preview.camera);
+    const pLeft = new THREE.Vector3(px + lx, py + ly, 0).unproject(preview.camera);
+
+    const plane = new THREE.Plane().setFromCoplanarPoints(p0, p1, p2);
+    if (plane.distanceToPoint(pLeft) > 0) {
+      plane.negate();
+    }
+    return plane;
+  }
+
+  const PLANE_EPSILON = 1e-5;
+
+  /**
+   * Classify every face of a Mesh as keep, discard, or straddling relative to plane.
+   */
+  function classifyMeshFaces(mesh, plane) {
+    const keep = [];
+    const discard = [];
+    const straddling = [];
+
+    if (!mesh || !mesh.mesh || !plane) {
+      return { keep, discard, straddling };
+    }
+
+    mesh.mesh.updateMatrixWorld();
+
+    const worldPos = new THREE.Vector3();
+    const vertexDistances = {};
+    for (const vkey in mesh.vertices) {
+      worldPos.fromArray(mesh.vertices[vkey]);
+      mesh.mesh.localToWorld(worldPos);
+      vertexDistances[vkey] = plane.distanceToPoint(worldPos);
+    }
+
+    for (const fkey in mesh.faces) {
+      const face = mesh.faces[fkey];
+      let hasKeep = false;
+      let hasDiscard = false;
+
+      for (const vkey of face.vertices) {
+        const d = vertexDistances[vkey];
+        if (d === undefined) continue;
+        if (d > PLANE_EPSILON) {
+          hasKeep = true;
+        } else if (d < -PLANE_EPSILON) {
+          hasDiscard = true;
+        }
+      }
+
+      if (hasKeep && hasDiscard) {
+        straddling.push(fkey);
+      } else if (hasDiscard) {
+        discard.push(fkey);
+      } else {
+        keep.push(fkey);
+      }
+    }
+
+    return { keep, discard, straddling };
+  }
+
+  function classifyVisibleMeshes(plane) {
+    const results = {};
+    for (const mesh of Mesh.all) {
+      if (!mesh.visibility || !mesh.mesh || !mesh.mesh.visible) continue;
+      results[mesh.name || mesh.uuid] = classifyMeshFaces(mesh, plane);
+    }
+    return results;
+  }
+
   class ZandatsuContext {
     constructor() {
       this.angle = Math.PI / 2;
@@ -150,6 +250,11 @@
       }
 
       this.updateOverlay();
+
+      const plane = buildCutPlane(this.angle, preview, this.pivotNdc);
+      if (plane) {
+        console.log("[Zandatsu] Face classification:", classifyVisibleMeshes(plane));
+      }
     }
 
     click(data) {
@@ -168,9 +273,11 @@
       }
 
       // Second click confirms the cut (mesh cutting added in Phase 4).
+      const plane = buildCutPlane(this.angle, preview, this.pivotNdc);
       console.log("[Zandatsu] Cut confirmed:", {
         pivotNdc: { x: this.pivotNdc.x, y: this.pivotNdc.y },
         angle: this.angle,
+        classification: plane ? classifyVisibleMeshes(plane) : null,
       });
       this.unlockPivot(data);
     }
